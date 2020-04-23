@@ -39,7 +39,8 @@ const defaultOpts = {
   dispatchResponder: promiseResponder,
   serializer: noop,
   deserializer: noop,
-  diffStrategy: shallowDiff
+  diffStrategy: shallowDiff,
+  partitionedKeys: []
 };
 
 /**
@@ -52,7 +53,8 @@ export default (store, {
   dispatchResponder = defaultOpts.dispatchResponder,
   serializer = defaultOpts.serializer,
   deserializer = defaultOpts.deserializer,
-  diffStrategy = defaultOpts.diffStrategy
+  diffStrategy = defaultOpts.diffStrategy,
+  partitionedKeys = defaultOpts.partitionedKeys
 } = defaultOpts) => {
   if (!portName) {
     throw new Error('portName is required in options');
@@ -92,18 +94,24 @@ export default (store, {
     }
   };
 
-  let actionListeners = [];
-  const subscribeToActions = (fn) => {
-    actionListeners.push(fn);
+  let actionListeners = {};
+  const subscribeToActions = (connectedTabId = 'global', fn) => {
+    actionListeners[connectedTabId] = [...(actionListeners[connectedTabId] || []), fn];
     // return unsubscribe function
     return () => {
-      actionListeners = actionListeners.filter((f) => f !== fn);
+      actionListeners[connectedTabId] = (actionListeners[connectedTabId] || []).filter((f) => f !== fn);
     };
   };
-  const postActionToListeners = ({ _sender, ...action }) => {
+  const listenersForPort = (connectedTabId) => {
+    const ids = ['global', String(connectedTabId)].filter(x => Boolean(x))
+    return Object.entries(actionListeners).flatMap(([id, listeners = []]) =>
+      ids.includes(String(id)) ? listeners : []
+    )
+  }
+  const postActionToListeners = ({ _sender: { tab: { id } = {}, forwardAction = false } = {}, ...action }) => {
     // actions with _sender came down from remote proxy stores so don't need to send them back
-    if (!Boolean(_sender)) {
-      actionListeners.forEach((fn) => fn(action));
+    if (forwardAction) {
+      listenersForPort(id).forEach((fn) => fn(action));
     }
   };
 
@@ -114,6 +122,7 @@ export default (store, {
     if (port.name !== portName) {
       return;
     }
+    const { sender: { tab: { id: connectedTabId } = {} } = {} } = port || {}
 
     const serializedMessagePoster = withSerializer(serializer)((...args) => port.postMessage(...args));
 
@@ -121,10 +130,23 @@ export default (store, {
 
     const patchState = () => {
       const state = store.getState();
-      const diff = diffStrategy(prevState, state);
+
+      const partitionedState =
+        partitionedKeys.length > 0
+          ? Object.fromEntries(
+              Object.entries(state).map(([key, value]) => {
+                if (partitionedKeys.includes(key)) {
+                  return [key, value[connectedTabId]]
+                }
+                return [key, value]
+              })
+            )
+          : state
+
+      const diff = diffStrategy(prevState, partitionedState);
 
       if (diff.length) {
-        prevState = state;
+        prevState = partitionedState;
 
         serializedMessagePoster({
           type: PATCH_STATE_TYPE,
@@ -134,7 +156,7 @@ export default (store, {
     };
 
     // Send event message down connected port on every redux action
-    const unsubscribeActionsSubscription = subscribeToActions((action) => {
+    const unsubscribeActionsSubscription = subscribeToActions(connectedTabId, (action) => {
       serializedMessagePoster({
         type: ACTION_TYPE,
         payload: action,
